@@ -14,8 +14,11 @@ MARKER = b'-- HD2-Addon: '
 
 
 def main():
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else \
-        Path('Addon/9ba626afa44a3aa3.patch_0')
+    if len(sys.argv) > 1:
+        path = Path(sys.argv[1])
+    else:
+        # resolve relative to the repo root so it works from any cwd
+        path = Path(__file__).resolve().parents[1] / 'Addon' / '9ba626afa44a3aa3.patch_0'
     data = path.read_bytes()
     at = data.find(MARKER)
     if at < 8:
