@@ -34,7 +34,12 @@
 
 ## 配置
 
-`%APPDATA%\Arrowhead\Helldivers2\fov_unlock.cfg`（没有就用默认 `fov = 100`）：
+`%APPDATA%\Arrowhead\Helldivers2\fov_unlock.cfg`
+
+**首次启动会自动生成**一份带注释的模板（管理器只部署 `Addon/`，不会把这个文件放进去，
+所以 mod 自己补一份）。文件不存在时也能跑，用内置默认 `fov = 100`；
+`STATUS` 里 `config_source=generated | ok | no_config_file` 能看到配置来源。
+**已有的 cfg 永远不会被覆盖。**
 
 ```ini
 enabled = true

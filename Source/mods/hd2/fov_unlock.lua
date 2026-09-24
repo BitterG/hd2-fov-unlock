@@ -36,7 +36,7 @@
 -- 注意：这是本地内存补丁。别人看不到你的视野；联机用有反作弊风险。
 
 local MOD_NAME = 'FOVUnlock'
-local VERSION = '2.1.0'
+local VERSION = '2.2.0'
 
 -- ---------------------------------------------------------------------------
 -- 单实例守卫
@@ -230,6 +230,7 @@ local function write_status()
         h:write('clamp_verified=' .. tostring(M.clamp_verified) .. '\n')
         h:write('float_decoder=' .. tostring(M.float_decoder) .. '\n')
         h:write('snapshot_fov=' .. tostring(M.snapshot_fov) .. '\n')
+        h:write('config_source=' .. tostring(M.config_source) .. '\n')
         h:write('last_write=' .. tostring(M.last_write) .. '\n')
         h:write('last_write_verdict=' .. tostring(M.last_write_verdict) .. '\n')
         h:write('settings_phase=' .. tostring(M.settings_phase) .. '\n')
@@ -316,6 +317,33 @@ local function parse_cfg(text)
     return cfg
 end
 
+-- 首次启动时写出来的模板。管理器只会部署 Addon/，不会把这个 cfg 放到
+-- %APPDATA%，所以没有它就在这里补一份带注释的，省得玩家自己去猜键名。
+local CONFIG_TEMPLATE = [[# FOV Unlock —— 绝地潜兵2 垂直视野解锁配置
+#
+# 这份文件是 mod 第一次启动时自动生成的，改完保存、重启游戏即可生效。
+# 注释以 '#' 或 ';' 开头；键名不区分大小写。删掉它也能跑（用默认 fov = 100）。
+
+enabled = true
+
+# Options -> Visuals -> Vertical Field of View 那个滑条的值，本体只允许 45..90。
+# 100 已经明显更宽；110-120 最舒服；超过 140 边缘拉伸很重。
+fov = 100
+
+# 是否把 fov 同步写进 user_settings.config（会先备份成 .fov_unlock.bak）。
+write_config_file = true
+
+# ===========================================================================
+# patch_code_clamp —— 默认 false，强烈建议保持 false
+#
+# true  = 额外去改 game.dll 可执行页里那条把视野夹到 90 的指令。
+#         改代码段是 nProtect GameGuard 最典型的特征，
+#         **实测会触发 GG，然后游戏直接关闭。**
+# false = 只做纯数据写入，game.dll 的代码段一个字节都不碰。
+# ===========================================================================
+patch_code_clamp = false
+]]
+
 local function load_config()
     -- patch_code_clamp 默认 false：改 game.dll 代码段会触发 GameGuard（实测会
     -- 直接关游戏），所以默认只走纯数据写入。
@@ -323,14 +351,27 @@ local function load_config()
                   patch_code_clamp = false }
     local dir = appdata_dir()
     if not dir then return cfg, 'no_appdata' end
+    local path = dir .. '/fov_unlock.cfg'
     local ok, text = pcall(function()
-        local f = io.open(dir .. '/fov_unlock.cfg', 'r')
+        local f = io.open(path, 'r')
         if not f then return nil end
         local t = f:read('*a')
         f:close()
         return t
     end)
-    if not ok or not text then return cfg, 'no_config_file' end
+    if not ok or not text then
+        -- 没有就生成一份模板（写失败也不影响运行，照旧用默认值）
+        local wrote = pcall(function()
+            local f = io.open(path, 'w')
+            if not f then error('cannot create') end
+            f:write(CONFIG_TEMPLATE)
+            f:close()
+        end)
+        if wrote then
+            return cfg, 'generated'
+        end
+        return cfg, 'no_config_file'
+    end
     local user = parse_cfg(text)
     if user.enabled ~= nil then
         cfg.enabled = (user.enabled == 'true' or user.enabled == '1')
@@ -1190,6 +1231,7 @@ end
 -- ---------------------------------------------------------------------------
 local function run()
     local cfg, cfg_status = load_config()
+    M.config_source = cfg_status
     emit('config ' .. cfg_status .. ' enabled=' .. tostring(cfg.enabled)
         .. ' fov=' .. tostring(cfg.fov))
 

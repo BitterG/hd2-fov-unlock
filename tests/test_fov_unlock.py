@@ -995,6 +995,46 @@ def test_retry_applies_when_object_appears_late(verbose=False):
     return True
 
 
+def test_config_is_generated_on_first_run(verbose=False):
+    """Managers only deploy Addon/, so the cfg is never placed in %APPDATA%.
+    The mod must write a commented template itself on first run."""
+    mem, _, _ = build_image()
+    add_stage2(mem, live_fov=90.0)
+    files = {
+        'C:/fake/Arrowhead/Helldivers2/user_settings.config': settings_text(90),
+    }
+    result, written = run_mod(mem, files=files)
+    assert get(result, 'config_source') == 'generated', get(result, 'config_source')
+    cfg = written.get('C:/fake/Arrowhead/Helldivers2/fov_unlock.cfg')
+    assert cfg, 'cfg was not generated'
+    for key in ('enabled = true', 'fov = 100', 'write_config_file = true',
+                'patch_code_clamp = false'):
+        assert key in cfg, f'{key!r} missing from the generated cfg'
+    assert '\ufeff' not in cfg, 'generated cfg contains a BOM'
+    # generated defaults still work: no code page touched, value applied
+    assert get(result, 'settings_written') is True, get(result, 'status')
+    assert not get(result, 'patch_applied')
+    if verbose:
+        print('   generated cfg bytes =', len(cfg))
+    return True
+
+
+def test_existing_config_is_never_overwritten(verbose=False):
+    mem, _, _ = build_image()
+    add_stage2(mem, live_fov=90.0)
+    mine = '# my own notes\nenabled = true\nfov = 120\nwrite_config_file = false\n'
+    result, written = run_mod(mem, files={
+        'C:/fake/Arrowhead/Helldivers2/fov_unlock.cfg': mine,
+        'C:/fake/Arrowhead/Helldivers2/user_settings.config': settings_text(90),
+    })
+    assert get(result, 'config_source') == 'ok', get(result, 'config_source')
+    assert written['C:/fake/Arrowhead/Helldivers2/fov_unlock.cfg'] == mine, \
+        'an existing cfg was modified'
+    assert get(result, 'desired_fov') == 120, get(result, 'desired_fov')
+    assert get(result, 'settings_written') is True, get(result, 'status')
+    return True
+
+
 def syntax_gate(source):
     """Compile `source` with LuaJIT and scan for 5.1-incompatible tokens.
 
@@ -1074,6 +1114,8 @@ TESTS = [
     test_packer_refuses_a_bom,
     test_packer_refuses_duplicate_declaration,
     test_packaged_body_compiles,
+    test_config_is_generated_on_first_run,
+    test_existing_config_is_never_overwritten,
     test_default_is_data_only_no_code_touch,
     test_data_only_mode_never_touches_page_protections,
     test_data_write_to_a_code_page_is_refused,

@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '2.1.0'
+VERSION = '2.2.0'
 OUTPUT = ROOT.parent / f'FOV-Unlock-{VERSION}.zip'
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 
