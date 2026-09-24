@@ -1,0 +1,15 @@
+{
+  "Version": 1,
+  "Guid": "ba67e533-40ee-4829-b555-4a2515343218",
+  "Name": "FOV Unlock - Vertical FOV above 90",
+  "Description": "Removes the engine's hard 90-degree ceiling on the Vertical Field of View setting so you can play wider than the in-game slider allows. The game stores the setting as vertical_fov in %APPDATA%/Arrowhead/Helldivers2/user_settings.config and clamps it to [45,90] while reading it; editing the file alone does not work because the game writes the clamped value back (verified in game). This mod locates that clamp in game.dll by instruction shape (a movss 45.0f / comiss / ja / movss 90.0f / minss sequence, all displacements wildcarded and both constants verified before anything is written), replaces the minss with a register move so the upper bound disappears while the 45 lower bound stays, and writes your chosen value into user_settings.config with a one-time backup. Requires Bingus Shared Loader v15 or newer. That is the only dependency: the loader's own API level is 1, which is what BingusSharedLoader.log prints on its first line, so no second mod is needed. Memory-only and reversible: disable the mod and Purge to restore everything. Local change only - other players never see your FOV - and it is not advisable in public multiplayer. Set your target FOV in %APPDATA%/Arrowhead/Helldivers2/fov_unlock.cfg. The result, including the located clamp address and the exact constants it verified, is written to FOV_UNLOCK_STATUS.txt in %LOCALAPPDATA%/CowboyBingus/Helldivers2/.",
+  "Options": [
+    {
+      "Name": "FOV Unlock",
+      "Description": "Raises the Vertical Field of View cap above 90. Edit fov_unlock.cfg, then restart the game and read FOV_UNLOCK_STATUS.txt.",
+      "Include": [
+        "Addon"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# Build output — regenerate with:
+#   python scripts/build_addon.py --source Source --output-dir Addon
+#   python scripts/package.py
+Addon/
+FOV-Unlock-*.zip
+
+# Scratch / recon byproducts
+recon/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
