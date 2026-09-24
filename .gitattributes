@@ -1,0 +1,9 @@
+# Keep the addon source byte-stable: its line endings feed straight into the
+# packaged resource body, whose MurmurHash64A the loader looks up. CRLF churn
+# would silently change that hash.
+* text=auto eol=lf
+
+# Never touch real binaries
+*.png binary
+*.zip binary
+*.patch_0 binary
