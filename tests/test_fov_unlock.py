@@ -77,11 +77,14 @@ def test_packaged_body_compiles(verbose=False):
     assert ARCHIVE.is_file(), 'run scripts/build_addon.py first'
     data = ARCHIVE.read_bytes()
     at = data.find(b'-- HD2-Addon: ')
-    assert at >= 0, 'no declaration in the archive'
-    body = data[at:]
-    end = body.find(b'\x00\x00\x00\x00')
-    if end > 0:
-        body = body[:end]
+    assert at >= 8, 'no declaration in the archive'
+    # The resource is <u32 body_len><u32 version=2><body>, so the declared
+    # length is authoritative - do NOT guess with a NUL-run search, which
+    # truncates the body and turns into a bogus syntax error at EOF.
+    assert struct.unpack_from('<I', data, at - 4)[0] == 2, 'unexpected envelope version'
+    body_len = struct.unpack_from('<I', data, at - 8)[0]
+    body = data[at:at + body_len]
+    assert len(body) == body_len, f'declared {body_len}, got {len(body)}'
     assert body.count(b'-- HD2-Addon: ') == 1, 'duplicate declaration in the body'
     assert b'\xef\xbb\xbf' not in body, 'BOM inside the packaged body'
     verdict = build_addon.compile_body(body, 'mods/hd2/fov_unlock')
