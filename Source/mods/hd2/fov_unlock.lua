@@ -36,7 +36,7 @@
 -- 注意：这是本地内存补丁。别人看不到你的视野；联机用有反作弊风险。
 
 local MOD_NAME = 'FOVUnlock'
-local VERSION = '2.2.0'
+local VERSION = '2.3.0'
 
 -- ---------------------------------------------------------------------------
 -- 单实例守卫
@@ -82,7 +82,6 @@ local function ensure_log()
     if log_handle then return log_handle end
     local dir = localappdata_dir()
     if not dir then return nil end
-    pcall(function() os.execute('mkdir "' .. dir .. '" >NUL 2>NUL') end)
     local ok, h = pcall(io.open, dir .. '/FOVUnlock.log', 'a')
     if ok and h then log_handle = h end
     return log_handle
@@ -194,7 +193,6 @@ end
 local function write_status()
     local dir = localappdata_dir()
     if not dir then return end
-    pcall(function() os.execute('mkdir "' .. dir .. '" >NUL 2>NUL') end)
     local ok, h = pcall(io.open, dir .. '/FOV_UNLOCK_STATUS.txt', 'w')
     if not ok or not h then return end
     pcall(function()
@@ -212,6 +210,12 @@ local function write_status()
                     .. '（纯数据模式，game.dll 代码段未被改动）；'
                     .. '本 mod 无法验证屏幕结果，请进游戏确认视野是否变宽'
             end
+        elseif M.phase ~= 'failed' and M.phase ~= 'error'
+            and (M.settings_phase == 'scanning' or M.settings_phase == 'field_scanning'
+                 or M.settings_phase == 'searching' or M.settings_phase == nil) then
+            -- 分帧扫描还没走完：这是正常中间态，不该报 FAILED
+            first = 'WORKING - 正在分帧定位设置对象（'
+                .. tostring(M.settings_detail) .. '），几秒内会生效'
         elseif M.patch_applied then
             first = 'PARTIAL - 只打上了内存上限补丁，没定位到活设置对象'
                 .. '（本局可能看不到变化，见 settings_detail）'
@@ -683,8 +687,14 @@ local P_UCOMISS_ANY = string.char(0x0F, 0x2E)
 local P_JA = string.char(0x77, 0x0C)
 local CLAMP_PATCH = string.char(0x0F, 0x28, 0xC8, 0x90)   -- movaps xmm1, xmm0 ; nop
 
-local CHUNK = 1024 * 1024
+-- 6.14 / 6.42：块要小、单次调用要有硬性 CPU 上限。
+-- 原来用 1MB 块且没有任何 deadline，一次把整个 .text（20MB+）在**主线程**上读完 ——
+-- 启动期正好撞上游戏自己的加载，Windows 会把窗口标成"未响应"，表现就是
+-- "有时候启动卡住，多试几次才好"。现在改成 256KB 块 + os.clock() 预算 + 可续跑。
+local CHUNK = 256 * 1024
 local OVERLAP = 64
+local SCAN_BUDGET = 0.0015       -- 单次调用最多约 1.5ms CPU
+local IDENTITY_BUDGET = 0.0015   -- 身份校验 / 字段扫描同样设上限
 
 -- Signed little-endian int32 out of an already-read chunk (1-based position).
 local function signed_i32(chunk, pos)
@@ -718,7 +728,6 @@ local SIG_DUMP_LIMIT = 48
 local function write_signature_dump(sites, reason)
     local dir = localappdata_dir()
     if not dir then return end
-    pcall(function() os.execute('mkdir "' .. dir .. '" >NUL 2>NUL') end)
     local ok, h = pcall(io.open, dir .. '/FOV_SIGNATURE_DUMP.txt', 'w')
     if not ok or not h then return end
     pcall(function()
@@ -791,11 +800,17 @@ local function find_clamp(api)
     local partial = {}
     local sites = {}
     local minss_total = 0
+    -- 通道① 是 opt-in 的，这里不做增量（不值得），但必须有硬性上限：
+    -- 超了就放弃并说明，绝不在主线程上一帧扫完 20MB 的 .text。
+    local deadline = os.clock() + 0.03
 
     for si = 1, #secs do
         local s = secs[si]
         local scanned = 0
         while scanned < s.size do
+            if os.clock() >= deadline then
+                return nil, 'scan_budget_exceeded'
+            end
             local want = CHUNK
             if scanned + want > s.size then want = s.size - scanned end
             if want <= 0 then break end
@@ -888,10 +903,14 @@ end
 -- ---------------------------------------------------------------------------
 local function find_clamp_fallback(api, secs, base)
     local candidates = {}
+    local deadline = os.clock() + 0.03
     for si = 1, #secs do
         local s = secs[si]
         local scanned = 0
         while scanned < s.size do
+            if os.clock() >= deadline then
+                return nil, 'scan_budget_exceeded'
+            end
             local want = CHUNK
             if scanned + want > s.size then want = s.size - scanned end
             if want <= 0 then break end
@@ -988,18 +1007,38 @@ local P_ADD_RCX_IMM = string.char(0x48, 0x81, 0xC1)
 
 -- 兜底：扫出所有 `mov rcx,[rip+d32]; add rcx,imm32` 里解析得到的设置结构地址。
 -- 返回带完整来历的条目，失败时可以直接落盘给别人离线分析。
-local function scan_settings_bases(api, secs, base)
-    local seen, list, raw = {}, {}, {}
-    for si = 1, #secs do
-        local s = secs[si]
-        local scanned = 0
-        while scanned < s.size do
-            local want = CHUNK
-            if scanned + want > s.size then want = s.size - scanned end
-            if want <= 0 then break end
-            local chunk = api.read(s.va + scanned, want)
+-- 可续跑的 .text 扫描。每步只吃 SCAN_BUDGET 的 CPU，剩下的交给下一帧。
+local function scan_new(secs)
+    return { secs = secs, si = 1, scanned = 0, seen = {}, list = {}, raw = {},
+             chunks = 0, done = false }
+end
+
+-- 推进一步；返回 true 表示扫完了。
+local function scan_step(api, st, budget)
+    if st.done then return true end
+    local deadline = os.clock() + (budget or SCAN_BUDGET)
+    while true do
+        -- 推进到下一个还没扫完的节（不花 CPU）
+        while st.si <= #st.secs and st.scanned >= st.secs[st.si].size do
+            st.si = st.si + 1
+            st.scanned = 0
+        end
+        if st.si > #st.secs then
+            st.done = true
+            break
+        end
+        -- 至少先做一块，再看预算，避免"一块没读就退出"永远推不动
+        if st.chunks > 0 and os.clock() >= deadline then break end
+
+        local s = st.secs[st.si]
+        local want = CHUNK
+        if st.scanned + want > s.size then want = s.size - st.scanned end
+        if want <= 0 then
+            st.scanned = s.size
+        else
+            local chunk = api.read(s.va + st.scanned, want)
             if chunk then
-                local chunk_base = s.va + scanned
+                local chunk_base = s.va + st.scanned
                 local from = 1
                 while true do
                     local i = chunk:find(P_MOV_RCX_RIP, from, true)
@@ -1014,8 +1053,8 @@ local function scan_settings_bases(api, secs, base)
                             local ok_ptr = singleton and singleton > 0x10000
                                 and singleton < 0x7FFFFFFFFFFF and singleton % 8 == 0
                             -- 原始形状命中：即使解不出指针也记下来，失败时才有东西可看
-                            if #raw < 64 then
-                                raw[#raw + 1] = {
+                            if #st.raw < 64 then
+                                st.raw[#st.raw + 1] = {
                                     site = chunk_base + (i - 1),
                                     global_va = global_va,
                                     struct_off = struct_off,
@@ -1024,12 +1063,12 @@ local function scan_settings_bases(api, secs, base)
                             end
                             if ok_ptr then
                                 local settings = singleton + struct_off
-                                if not seen[settings] then
-                                    seen[settings] = true
-                                    list[#list + 1] = {
-                                        settings = settings,
+                                if not st.seen[settings] then
+                                    st.seen[settings] = true
+                                    -- 只存 global_va + struct_off：单例指针可能在
+                                    -- 后续帧才被赋值，校验时重新解一次即可（很便宜）
+                                    st.list[#st.list + 1] = {
                                         global_va = global_va,
-                                        singleton = singleton,
                                         struct_off = struct_off,
                                         site = chunk_base + (i - 1),
                                     }
@@ -1039,12 +1078,16 @@ local function scan_settings_bases(api, secs, base)
                     end
                 end
             end
-            scanned = scanned + want - OVERLAP
-            if scanned < 0 then scanned = 0 end
-            if want < CHUNK then break end
+            st.chunks = st.chunks + 1
+            if want < CHUNK then
+                st.scanned = s.size          -- 最后一块，这一节扫完
+            else
+                st.scanned = st.scanned + want - OVERLAP
+                if st.scanned < 0 then st.scanned = 0 end
+            end
         end
     end
-    return list, raw
+    return st.done
 end
 
 -- 6.19 / 6.30：活设置对象没定位到时的证据文件。把每一条候选的来历和它前 0x40
@@ -1054,7 +1097,6 @@ local CHAIN_DUMP_LIMIT = 32
 local function write_chain_dump(api, base, known, entries, raw, reason)
     local dir = localappdata_dir()
     if not dir then return end
-    pcall(function() os.execute('mkdir "' .. dir .. '" >NUL 2>NUL') end)
     local ok, h = pcall(io.open, dir .. '/FOV_CHAIN_DUMP.txt', 'w')
     if not ok or not h then return end
     pcall(function()
@@ -1100,7 +1142,8 @@ local function write_chain_dump(api, base, known, entries, raw, reason)
 end
 
 -- 返回 settings 地址（唯一通过身份校验的那个），外加诊断字符串。
-local function locate_settings_object(api, secs, base, expected)
+-- 返回 found, detail, pending。pending=true 表示这一步没做完，下一帧继续。
+local function locate_settings_object(api, base, expected, scan)
     local cands, origins = {}, {}
     local function add(addr, how)
         if addr and not origins[addr] then
@@ -1109,7 +1152,7 @@ local function locate_settings_object(api, secs, base, expected)
         end
     end
 
-    -- 主路径：已知的全局单例链
+    -- 主路径：已知的全局单例链（很便宜，每次重读一次）
     local known = nil
     local singleton = api.u64(base + KNOWN.global_rva)
     if singleton and singleton > 0x10000 and singleton < 0x7FFFFFFFFFFF then
@@ -1121,12 +1164,24 @@ local function locate_settings_object(api, secs, base, expected)
         add(known.settings, 'known')
     end
 
-    -- 兜底：形状扫描
-    local scanned, raw = scan_settings_bases(api, secs, base)
-    for i = 1, #scanned do add(scanned[i].settings, 'scanned') end
+    -- 形状扫描的候选。扫描是几帧前做的，**单例指针可能那之后才被赋值**，
+    -- 所以这里重新解一次（一次 u64 读取，很便宜），而不是用扫描时的快照。
+    local scanned, raw = {}, scan.raw
+    for i = 1, #scan.list do
+        local e = scan.list[i]
+        local sg = api.u64(e.global_va)
+        if sg and sg > 0x10000 and sg < 0x7FFFFFFFFFFF and sg % 8 == 0 then
+            local settings = sg + e.struct_off
+            scanned[#scanned + 1] = {
+                settings = settings, global_va = e.global_va, singleton = sg,
+                struct_off = e.struct_off, site = e.site,
+            }
+            add(settings, 'scanned')
+        end
+    end
 
     local good, detail = {}, {}
-    -- ① 已知偏移优先：偏移和值同时吻合，是最强的证据
+    -- ① 已知偏移优先：偏移和值同时吻合，是最强的证据（每候选一次读取）
     for i = 1, #cands do
         local addr = cands[i]
         local v = api.f32(addr + KNOWN.fov_off)
@@ -1138,56 +1193,93 @@ local function locate_settings_object(api, secs, base, expected)
         end
     end
     if #good == 1 then
-        return good[1], table.concat(detail, ' '), known, scanned, raw
+        return good[1], table.concat(detail, ' '), false, known, scanned, raw
     end
     if #good > 1 then
         return nil, 'ambiguous_known_offset [' .. table.concat(detail, ' ') .. ']',
-            known, scanned
+            false, known, scanned, raw
     end
 
     -- ② 字段偏移漂移兜底：在结构里按值找字段，要求全进程唯一。
-    --    只认一个 (base, offset) 组合，多于一个就拒绝。
-    local found = {}
-    for i = 1, #cands do
-        local addr = cands[i]
-        local off = 0
-        while off <= 0x400 do
-            local w = api.f32(addr + off)
-            if w and expected[w] then
-                found[#found + 1] = { settings = addr, off = off, value = w,
-                                      how = origins[addr] .. '/scanned_off' }
-            end
-            off = off + 4
-        end
+    --    **增量做**：一帧最多 IDENTITY_BUDGET 的 CPU，避免几百次读取卡住主线程。
+    if not M.field_scan then
+        M.field_scan = { i = 1, off = 0, found = {}, done = false }
     end
-    if #found == 1 then
-        return found[1], 'field_scan ' .. table.concat(detail, ' '), known, scanned, raw
+    local fs = M.field_scan
+    local deadline = os.clock() + IDENTITY_BUDGET
+    while not fs.done do
+        if fs.i > #cands then
+            fs.done = true
+            break
+        end
+        local addr = cands[fs.i]
+        local w = api.f32(addr + fs.off)
+        if w and expected[w] then
+            fs.found[#fs.found + 1] = { settings = addr, off = fs.off, value = w,
+                                        how = origins[addr] .. '/scanned_off' }
+        end
+        fs.off = fs.off + 4
+        if fs.off > 0x400 then
+            fs.off = 0
+            fs.i = fs.i + 1
+        end
+        if fs.i <= #cands and os.clock() >= deadline then break end
+    end
+    if not fs.done then
+        return nil, string.format('field_scan in progress %d/%d candidates',
+            fs.i, #cands), true, known, scanned, raw
+    end
+    if #fs.found == 1 then
+        return fs.found[1], 'field_scan ' .. table.concat(detail, ' '),
+            false, known, scanned, raw
     end
     return nil, string.format('field_scan candidates=%d matches=%d [%s]',
-        #cands, #found, table.concat(detail, ' ')), known, scanned, raw
+        #cands, #fs.found, table.concat(detail, ' ')), false, known, scanned, raw
 end
 
 -- ---------------------------------------------------------------------------
 -- 通道②：定位「活着的」设置对象并写入它的 vertical_fov。
 --
--- 抽成函数是为了**启动时没赶上就重试**：addon 的加载顺序/时机可能早于引擎建好
--- 设置对象，那时扫不到任何东西。实测加载顺序会影响结果，所以启动只试一次是不够的。
+-- 两段式，都可以跨帧续跑：
+--   A. 增量扫描 .text 找候选（每步 ≤ SCAN_BUDGET 的 CPU）
+--   B. 身份校验 + 写入（每步 ≤ IDENTITY_BUDGET）
+-- 这样启动期不会有一帧吃掉几十 MB 的读取，也就不会再让窗口"未响应"。
 -- ---------------------------------------------------------------------------
 local function apply_live_settings(api, snapshot, expected)
-    M.settings_phase = 'searching'
-    local secs = sections_of(api, M.game_dll_base)
-    if not secs then
-        M.settings_phase = 'no_sections'
-        note('通道②跳过：读不到节表')
+    -- A. 扫描
+    if not M.scan then
+        local secs = sections_of(api, M.game_dll_base)
+        if not secs then
+            M.settings_phase = 'no_sections'
+            note('通道②跳过：读不到节表')
+            return false
+        end
+        M.scan = scan_new(secs)
+        M.scan_started = os.clock()
+    end
+    if not M.scan.done then
+        scan_step(api, M.scan, SCAN_BUDGET)
+    end
+    if not M.scan.done then
+        M.settings_phase = 'scanning'
+        M.settings_detail = string.format('scanning %d/%d sections, %d chunks',
+            M.scan.si, #M.scan.secs, M.scan.chunks)
         return false
     end
+
     if not snapshot then
         note('通道②注意：user_settings.config 里没有 vertical_fov 快照，'
             .. '身份校验只剩目标值这一条（证据变弱）')
     end
-    local found, detail, known, scanned, raw =
-        locate_settings_object(api, secs, M.game_dll_base, expected)
+
+    -- B. 身份校验 + 写入
+    local found, detail, pending, known, scanned, raw =
+        locate_settings_object(api, M.game_dll_base, expected, M.scan)
     M.settings_detail = detail
+    if pending then
+        M.settings_phase = 'field_scanning'
+        return false
+    end
     if not found then
         M.settings_phase = 'not_located'
         emit('settings object not located: ' .. tostring(detail))
@@ -1431,6 +1523,9 @@ local function run()
     if M.settings_written then
         note('通道②已生效（纯数据）。如果你在设置里动过滑条，'
             .. 'mod 每 1.5 秒会把值补回去')
+    elseif M.settings_phase == 'scanning' or M.settings_phase == 'field_scanning' then
+        note('通道②正在分帧扫描（' .. tostring(M.settings_detail)
+            .. '）：启动期不会有一帧吃掉几十 MB 的读取，几秒内会自己完成')
     else
         note('通道②这次没写成（settings_phase=' .. tostring(M.settings_phase)
             .. '），会在随后的帧里重试最多几次；'
@@ -1480,21 +1575,42 @@ else
             local api = M.api
             if not api then return end
             local now = api.time()
+
+            -- ⓪-a 扫描/校验没做完 → 小步快跑（每 20ms 推一步，每步 ≤1.5ms CPU）。
+            --      这一段在启动期就能把 .text 扫完，但绝不占满一帧。
+            if not M.settings_written
+                and (M.settings_phase == 'scanning'
+                     or M.settings_phase == 'field_scanning'
+                     or M.settings_phase == 'searching')
+                and now >= (M.scan_next or 0) then
+                M.scan_next = now + 0.02
+                local was = M.settings_phase
+                pcall(apply_live_settings, api, M.snapshot_fov, M.expected_set or {})
+                if M.settings_written then
+                    emit('channel 2 applied (was ' .. tostring(was) .. ')')
+                end
+                next_check = now + 1.5
+                return
+            end
+
             if now < next_check then return end
             next_check = now + 1.5
 
-            -- ⓪ 通道② 启动时没写成 → 重试。
-            --    加载顺序/时机可能让 addon 早于设置对象建成，那时什么都扫不到；
-            --    只在"还没找到"这类**可能自己变好**的状态上重试（写入被拒/回读
-            --    不符重试没意义）。退避 8 秒，最多 5 次，90 秒后彻底停手（技能 6.14）。
+            -- ⓪-b 扫描做完了但没定位到 → 退避重试。
+            --      扫描结果已缓存、单例指针会重新解析，所以重试很便宜；
+            --      只在"还没找到"这类**可能自己变好**的状态上重试
+            --      （写入被拒/回读不符重试没意义）。8 秒一次、最多 5 次、90 秒封顶。
             local retryable = (M.settings_phase == 'not_located'
                 or M.settings_phase == 'no_sections')
-            if api and M.game_dll_base and not M.settings_written and retryable
+            if M.game_dll_base and not M.settings_written and retryable
                 and (M.stage2_attempts or 0) < 5
                 and now < (M.stage2_deadline or 0)
                 and now >= (M.stage2_next or 0) then
                 M.stage2_attempts = (M.stage2_attempts or 0) + 1
                 M.stage2_next = now + 8
+                -- 重新扫一遍（可能是对象还没建），扫描本身仍是增量、有预算的
+                M.scan = nil
+                M.field_scan = nil
                 pcall(apply_live_settings, api, M.snapshot_fov, M.expected_set or {})
                 if M.settings_written then
                     emit('channel 2 succeeded on retry ' .. tostring(M.stage2_attempts))

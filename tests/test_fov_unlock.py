@@ -181,11 +181,12 @@ class Memory:
 
 
 def build_image(*, real_site=True, real_45=45.0, decoy_first=True,
-                decoy_45=46.0, decoy_has_comiss=False, real_xmm=1, decoy_xmm=1):
+                decoy_45=46.0, decoy_has_comiss=False, real_xmm=1, decoy_xmm=1,
+                text_size=TEXT_SIZE):
     """Synthesise a game.dll-like image carrying the clamp sequence."""
     mem = Memory()
     mem.add_region(IMAGE_BASE, 0x1000, protect=0x02)      # image headers
-    mem.add_region(TEXT_VA, TEXT_SIZE, protect=0x20)      # PAGE_EXECUTE_READ
+    mem.add_region(TEXT_VA, text_size, protect=0x20)      # PAGE_EXECUTE_READ
     mem.add_region(RDATA_VA, RDATA_SIZE, protect=0x02)    # PAGE_READONLY
 
     # --- PE headers so the addon can walk the section table -------------
@@ -198,7 +199,7 @@ def build_image(*, real_site=True, real_45=45.0, decoy_first=True,
     mem.write(IMAGE_BASE + e_lfanew + 6, struct.pack('<H', nsec))
     mem.write(IMAGE_BASE + e_lfanew + 20, struct.pack('<H', opt_size))
     sec = IMAGE_BASE + e_lfanew + 24 + opt_size
-    mem.write(sec + 8, struct.pack('<II', TEXT_SIZE, 0x1000))
+    mem.write(sec + 8, struct.pack('<II', text_size, 0x1000))
     mem.write(sec + 36, struct.pack('<I', 0x60000020))      # CNT_CODE|EXEC|READ
     sec2 = sec + 40
     mem.write(sec2 + 8, struct.pack('<II', RDATA_SIZE, 0x10000))
@@ -814,7 +815,11 @@ def test_stage2_refuses_when_identity_check_fails(verbose=False):
     this is not the settings object (build drift). Refuse, do not write."""
     mem, _, _ = build_image()
     _, settings = add_stage2(mem, live_fov=77.0)
-    result, _ = run_mod(mem, files=stage2_files(90, 120))
+    holder = {}
+    result, _ = run_mod(mem, files=stage2_files(90, 120), with_update=True,
+                        globals_out=holder)
+    # the drifted-offset scan is incremental; let it finish before judging
+    drive_update(result, holder)
     assert not get(result, 'settings_written'), 'wrote through a failed identity check'
     assert get(result, 'settings_phase') == 'not_located', get(result, 'settings_phase')
     got = struct.unpack('<f', mem.read(settings + FOV_OFF, 4))[0]
@@ -858,13 +863,49 @@ def test_recheck_reasserts_when_game_reverts_value(verbose=False):
     return True
 
 
+def drive_update(result, holder, iterations=400, step_ms=50):
+    """Advance the stub clock and pump the update hook until the mod settles."""
+    g = holder['g']
+    for i in range(iterations):
+        if get(result, 'settings_written'):
+            break
+        g.__now_ms = 12345 + (i + 1) * step_ms
+        g.update(0.016)
+
+
+def test_scan_is_incremental_and_resumable(verbose=False):
+    """A big .text must NOT be scanned in one call. Scanning 20MB on the main
+    thread during startup is what made the window go 'not responding'; the
+    first pass must stop at the CPU budget and later frames must finish it."""
+    mem, _, _ = build_image(text_size=2 * 1024 * 1024)
+    add_stage2(mem, live_fov=90.0)
+    holder = {}
+    result, _ = run_mod(mem, files=stage2_files(90, 120), with_update=True,
+                        globals_out=holder)
+    assert not get(result, 'settings_written'), \
+        'the whole .text was scanned in a single call'
+    phase = get(result, 'settings_phase')
+    assert phase in ('scanning', 'field_scanning'), phase
+    if verbose:
+        print('   after first pass:', phase, '|', get(result, 'settings_detail'))
+
+    drive_update(result, holder)
+    assert get(result, 'settings_written') is True, get(result, 'settings_detail')
+    return True
+
+
 def test_stage2_finds_field_when_offset_drifted(verbose=False):
     """The +0x2C field offset is also build-specific. If it moves, the value
-    scan must discover the new offset - and must not touch the old one."""
+    scan must discover the new offset - and must not touch the old one.
+    That scan is incremental now, so drive the update hook to completion."""
     mem, _, _ = build_image()
     _, settings = add_stage2(mem, live_fov=90.0, heap_slot=0x34)
-    result, _ = run_mod(mem, files=stage2_files(90, 120))
-    assert get(result, 'settings_written') is True, get(result, 'status')
+    holder = {}
+    result, _ = run_mod(mem, files=stage2_files(90, 120), with_update=True,
+                        globals_out=holder)
+    if not get(result, 'settings_written'):
+        drive_update(result, holder)
+    assert get(result, 'settings_written') is True, get(result, 'settings_detail')
     assert get(result, 'settings_off') == 0x34, get(result, 'settings_how')
     got = struct.unpack('<f', mem.read(settings + 0x34, 4))[0]
     assert abs(got - 120.0) < 0.01, got
@@ -1134,6 +1175,7 @@ TESTS = [
     test_stage2_refuses_when_identity_check_fails,
     test_stage2_scanned_fallback_locates_object,
     test_stage2_finds_field_when_offset_drifted,
+    test_scan_is_incremental_and_resumable,
     test_chain_dump_is_written_when_object_not_located,
     test_clamp_dump_has_content_when_constants_moved,
     test_cross_launch_verdict_detects_engine_clamp,
